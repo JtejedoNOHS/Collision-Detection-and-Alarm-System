@@ -490,3 +490,18 @@ void setupTriggerEndpoint() {
 void setupTriggerFunctionality() {
   setupTriggerEndpoint();
 }
+
+// Function to Trigger Manual Alert (SMS and Buzzer)
+void triggerManualAlert() {
+  Serial.println("Manual Alert Triggered!");
+
+  // Activate the buzzer
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  // Send an SMS alert
+  sendManualSMS();
+
+  // Keep the buzzer on for 5 seconds, then turn it off
+  delay(5000);
+  digitalWrite(BUZZER_PIN, LOW);
+}
