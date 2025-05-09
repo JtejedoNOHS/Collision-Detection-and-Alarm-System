@@ -1,145 +1,157 @@
-#include "WifiCam.hpp"
-#include <WiFi.h>
-#include <SD_MMC.h>
-#include <WiFiUdp.h>
 #include "esp_camera.h"
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "FS.h"
+#include "SD_MMC.h"
 
-static const char* WIFI_SSID = "ESP32-Accident-System";
-static const char* WIFI_PASS = "12345678";
+// Camera pin config for AI Thinker ESP32-CAM
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
 
-esp32cam::Resolution initialResolution;
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
 
+// WiFi config
+const char* ssid = "ESP32-Accident-System";
+const char* password = "12345678";
+
+// UDP config
 WiFiUDP udp;
+const int udpPort = 12345;
 
-// File for saving video
-File videoFile;
+// Video config
+const int recordingDuration = 15; // seconds
+const int frameInterval = 500; // ms between frames
 
-// UDP Configuration
-const uint16_t localUdpPort = 8080; // Port for receiving UDP packets
-char incomingPacket[255]; // Buffer for incoming packets
-
-// Function to start recording video
-bool startRecording() {
-  videoFile = SD_MMC.open("/video.avi", FILE_WRITE);
-  if (!videoFile) {
-    Serial.println("Failed to open video file for writing.");
-    return false;
-  }
-
-  Serial.println("Recording started.");
-  return true;
-}
-
-// Function to stop recording video
-void stopRecording() {
-  if (videoFile) {
-    videoFile.close();
-    Serial.println("Recording stopped.");
-  }
-}
-
-// Function to capture a frame and save to video file
-void captureFrame() {
-  camera_fb_t* frame = esp_camera_fb_get();
-  if (frame) {
-    videoFile.write(frame->buf, frame->len);
-    esp_camera_fb_return(frame);
-  } else {
-    Serial.println("Failed to capture frame.");
-  }
-}
-
-// Function to record video
-void recordVideo() {
-  unsigned long startTime = millis();
-  const unsigned long recordDuration = 10000; // Record for 10 seconds
-
-  while (millis() - startTime < recordDuration) {
-    captureFrame();
-    delay(100); // Adjust delay for frame rate
-  }
-  stopRecording();
-}
+void startRecording();
+void saveFrame(fs::FS &fs, String path, camera_fb_t *fb);
 
 void setup() {
   Serial.begin(115200);
-  Serial.println();
-  esp32cam::setLogger(Serial);
-  delay(1000);
 
-  // Initialize WiFi
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  if (WiFi.waitForConnectResult() != WL_CONNECTED) {
-    Serial.printf("WiFi failure %d\n", WiFi.status());
-    delay(5000);
-    ESP.restart();
+  // Connect to WiFi (as station)
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
-  Serial.println("WiFi connected");
-  Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
-  delay(1000);
+  Serial.println("\nWiFi Connected: " + WiFi.localIP().toString());
 
-  // Initialize SD card
-  if (!SD_MMC.begin()) {
-    Serial.println("SD card initialization failed.");
-    delay(5000);
-    ESP.restart();
+  // Init camera
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  if(psramFound()){
+    config.frame_size = FRAMESIZE_VGA;
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+  } else {
+    config.frame_size = FRAMESIZE_QVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
   }
-  Serial.println("SD card initialized.");
 
-  // Initialize camera
-  {
-    using namespace esp32cam;
-
-    initialResolution = Resolution::find(1024, 768);
-
-    Config cfg;
-    cfg.setPins(pins::AiThinker);
-    cfg.setResolution(initialResolution);
-    cfg.setJpeg(80);
-
-    bool ok = Camera.begin(cfg);
-    if (!ok) {
-      Serial.println("Camera initialization failed.");
-      delay(5000);
-      ESP.restart();
-    }
-    Serial.println("Camera initialized.");
+  // Camera init
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed: 0x%x", err);
+    return;
   }
+
+  // Init SD card
+  if(!SD_MMC.begin()){
+    Serial.println("SD Card Mount Failed");
+    return;
+  }
+  uint8_t cardType = SD_MMC.cardType();
+  if(cardType == CARD_NONE){
+    Serial.println("No SD Card attached");
+    return;
+  }
+  Serial.println("SD Card initialized");
 
   // Start UDP listener
-  if (udp.begin(localUdpPort)) {
-    Serial.printf("Listening for UDP messages on port %d\n", localUdpPort);
-  } else {
-    Serial.println("Failed to start UDP listener.");
-  }
+  udp.begin(udpPort);
+  Serial.println("Listening UDP on port " + String(udpPort));
 }
 
 void loop() {
-  listenForUdpCommand();
-}
-
-// Function to listen for UDP commands
-void listenForUdpCommand() {
   int packetSize = udp.parsePacket();
   if (packetSize) {
-    // Receive the UDP packet
-    int len = udp.read(incomingPacket, sizeof(incomingPacket) - 1);
-    if (len > 0) {
-      incomingPacket[len] = '\0'; // Null-terminate the string
-    }
-    Serial.printf("Received UDP packet: %s\n", incomingPacket);
-
-    // Check if the command is "START_RECORDING"
+    char incomingPacket[255];
+    int len = udp.read(incomingPacket, 255);
+    if (len > 0) incomingPacket[len] = '\0';
+    Serial.println("UDP packet: " + String(incomingPacket));
     if (String(incomingPacket) == "START_RECORDING") {
-      Serial.println("START_RECORDING command received.");
-      if (startRecording()) {
-        Serial.println("Recording started via UDP command.");
-        recordVideo();
-      } else {
-        Serial.println("Failed to start recording via UDP command.");
-      }
+      Serial.println("Trigger received, start recording...");
+      startRecording();
     }
   }
 }
+
+void startRecording() {
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  localtime_r(&now, &timeinfo);
+  char filename[64];
+  strftime(filename, sizeof(filename), "/video_%Y%m%d_%H%M%S.mjpeg", &timeinfo);
+
+  File videoFile = SD_MMC.open(filename, FILE_WRITE);
+  if (!videoFile) {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  Serial.println("Recording: " + String(filename));
+
+  unsigned long startMillis = millis();
+  while (millis() - startMillis < recordingDuration * 1000) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      continue;
+    }
+    // Write JPEG frame to file
+    videoFile.write(fb->buf, fb->len);
+    videoFile.flush();
+    Serial.println("Saved frame: " + String(fb->len) + " bytes");
+    esp_camera_fb_return(fb);
+    delay(frameInterval);
+  }
+
+  videoFile.close();
+  Serial.println("Recording finished");
+}
+

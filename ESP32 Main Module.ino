@@ -4,44 +4,45 @@
 #include <Adafruit_Sensor.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <TinyGPS++.h>
-#include <Ultrasonic.h>
 #include <Preferences.h>
+#include <math.h>
+#include <TinyGPS++.h>
 
 // OLED Display
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// MPU6050
+// MPU6050 Accelerometer and Gyro
 Adafruit_MPU6050 mpu;
-bool mpuAvailable = false;
-sensors_event_t a, g, temp;
+bool mpuAvailable = false; // Track MPU availability
 
-// Ultrasonic Sensor
+// Ultrasonic Sensor Pins
 #define TRIG_PIN 12
 #define ECHO_PIN 13
-Ultrasonic ultrasonic(TRIG_PIN, ECHO_PIN);
 
-// Buzzer & Button
+// Buzzer and Buttons
 #define BUZZER_PIN 25
-#define RESET_PIN 26
+#define RESET_PIN 26 // Combined reset and manual alert button
 
-// SIM800L and GPS
-HardwareSerial sim800(1); // UART1
-HardwareSerial gps(2);    // UART2
+// GSM Module and GPS using HardwareSerial
+HardwareSerial sim800(1);
+HardwareSerial gps(2);
 #define SIM800_RX 16
 #define SIM800_TX 17
 #define GPS_RX 4
 #define GPS_TX 5
 
-TinyGPSPlus gpsParser;
+// Access Point Configuration
+const char *ssid = "ESP32-Accident-System";
+const char *password = "12345678";
 
-// Web server
+// Web Server
 WebServer server(80);
+Preferences preferences;
 
-// Preferences for saving recipient numbers
-Preferences prefs;
+// TinyGPS++ Object
+TinyGPSPlus gpsParser;
 
 // Variables
 float filteredGX = 0, filteredGY = 0, filteredGZ = 0;
@@ -50,256 +51,494 @@ String severity = "No Accident";
 String gpsLocation = "GPS Unavailable";
 String gpsTime = "Time: Unavailable";
 bool accidentDetected = false;
-unsigned long flippedStartTime = 0;
-bool flippedTimerStarted = false;
-unsigned long lastButtonPress = 0;
-int buttonPressCount = 0;
+String carOrientation = "Upright";
+String sim800Status = "Checking...";
+
+// Timer Variables for Reset Button
+unsigned long resetButtonPressTime = 0;
+unsigned long resetButtonReleaseTime = 0; // To track release time for short press
+const unsigned long resetHoldDuration = 30000; // 30 seconds
+const unsigned long shortPressDuration = 5000; // 500 milliseconds for short press detection
+
+// Timer Variables for Accident SMS Delay
+const unsigned long accidentSMSDelay = 5000; // 5 seconds
+unsigned long accidentDetectionTime = 0;
+bool sendSMSAfterDelay = false;
+
+// Timer Variables for Page Switching
+unsigned long pageCycleTime = 0; // Time to track page cycling
+const unsigned long pageSwitchInterval = 5000; // Switch pages every 5 seconds
+int currentPage = 1; // Start on Page 1
+
+// G-Force Threshold
+const float gForceThreshold = 3.0; // Threshold for accident detection
 
 void setup() {
   Serial.begin(115200);
-  Wire.begin();
 
-  // OLED init
+  // Initialize OLED Display
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for (;;);
+    Serial.println("OLED initialization failed!");
+    while (1);
   }
   display.clearDisplay();
   display.setTextSize(1);
-  display.setCursor(0,0);
-  display.println("Initializing...");
-  display.display();
+  display.setTextColor(SSD1306_WHITE);
 
-  // MPU6050 init
-  if (mpu.begin()) {
-    mpuAvailable = true;
-  } else {
-    display.println("MPU6050 Failed!");
-    display.display();
-  }
+  // Attempt to Initialize MPU6050
+  initializeMPU();
 
-  // Buzzer & Button
+  // Initialize Ultrasonic Sensor
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Initialize Buzzer and Buttons
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RESET_PIN, INPUT_PULLUP);
-  pinMode(ESP32CAM_TRIGGER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-  digitalWrite(ESP32CAM_TRIGGER_PIN, LOW);
 
-  // SIM800L
+  // Initialize SIM800L UART
   sim800.begin(9600, SERIAL_8N1, SIM800_RX, SIM800_TX);
   delay(1000);
-  sim800.println("AT+CFUN=1");
-  delay(500);
-  sim800.println("AT+CREG?");
-  delay(500);
+  checkSIM800L(); // Check if SIM800L is working
 
-  // GPS
+  // Initialize GPS UART
   gps.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
 
-  // Load recipients from preferences
-  prefs.begin("recipients", false);
-  numRecipients = prefs.getInt("count", 1);
-  for (int i = 0; i < numRecipients; i++) {
-    recipientNumbers[i] = prefs.getString(("num" + String(i)).c_str(), "+639XXXXXXXXX");
-  }
+  // Initialize Preferences
+  preferences.begin("sms-config", false);
+  String recipientNumber = preferences.getString("phone", "+639287523354" );
+  Serial.println("Loaded phone number: " + recipientNumber);
 
-  // WiFi AP
-  WiFi.softAP("ESP32_ACCIDENT", "password123");
-  server.on("/", handleRoot);
-  server.on("/recipients", handleRecipients);
+  // Configure Wi-Fi Access Point
+  WiFi.softAP(ssid, password);
+  Serial.println("AP IP Address: " + WiFi.softAPIP().toString());
+
+  // Configure Web Server
+  server.on("/", []() {
+    String html = "<h1>ESP32 Accident Detection System</h1>";
+    server.send(200, "text/html", html);
+  });
   server.begin();
-
-  display.println("Setup complete.");
-  display.display();
 }
 
 void loop() {
+  // Handle Web Server
   server.handleClient();
-  checkButton();
-  readMPU();
-  readUltrasonic();
-  readGPS();
-  updateDisplay();
-}
 
-void checkButton() {
-  if (digitalRead(RESET_PIN) == LOW) {
-    if (millis() - lastButtonPress < 400) {
-      buttonPressCount++;
-    } else {
-      buttonPressCount = 1;
+  // Check if the reset button is pressed
+  if (digitalRead(RESET_PIN) == LOW) { // Assuming LOW indicates button press
+    if (resetButtonPressTime == 0) {
+      resetButtonPressTime = millis(); // Start timing the button press
+    } else if (millis() - resetButtonPressTime >= resetHoldDuration) {
+      disableSystem(); // Disable the whole system after holding for 30 seconds
     }
-    lastButtonPress = millis();
-
-    if (buttonPressCount >= 2) {
-      triggerAccident("Manual Trigger");
+  } else if (resetButtonPressTime > 0) { // Button was released
+    resetButtonReleaseTime = millis();
+    if (resetButtonReleaseTime - resetButtonPressTime < resetHoldDuration &&
+        resetButtonReleaseTime - resetButtonPressTime > shortPressDuration) {
+      triggerManualAlert(); // Short press triggers manual alert
     }
-
-    unsigned long holdTime = 0;
-    while (digitalRead(RESET_PIN) == LOW) {
-      delay(10);
-      holdTime += 10;
-      if (holdTime >= 15000) { // 15 sec
-        ESP.restart();
-      }
-    }
-  }
-}
-
-void readMPU() {
-  if (!mpuAvailable) return;
-  mpu.getEvent(&a, &g, &temp);
-
-  float accMag = sqrt(a.acceleration.x * a.acceleration.x +
-                      a.acceleration.y * a.acceleration.y +
-                      a.acceleration.z * a.acceleration.z) / 9.8; // in G
-
-  bool flipped = abs(a.acceleration.z) < 3;
-
-  if (accMag >= IMPACT_THRESHOLD) {
-    triggerAccident("Impact " + String(accMag, 2) + "G");
+    resetButtonPressTime = 0; // Reset the timer
   }
 
-  if (flipped) {
-    if (!flippedTimerStarted) {
-      flippedStartTime = millis();
-      flippedTimerStarted = true;
-    } else if (millis() - flippedStartTime >= FLIP_TIMEOUT) {
-      triggerAccident("Flipped >15s");
-    }
-  } else {
-    flippedTimerStarted = false;
-  }
-}
-
-void triggerAccident(String reason) {
-  if (accidentDetected) return;
-  accidentDetected = true;
-
-  digitalWrite(BUZZER_PIN, HIGH);
-  digitalWrite(ESP32CAM_TRIGGER_PIN, HIGH);
-
-  String sms = composeSMS(reason);
-
-  for (int i = 0; i < numRecipients; i++) {
-    sendSMS(recipientNumbers[i], sms);
-    delay(SMS_DELAY_BETWEEN);
+  // Attempt to reinitialize MPU6050 if it is not available
+  if (!mpuAvailable) {
+    initializeMPU();
   }
 
-  digitalWrite(BUZZER_PIN, LOW);
-}
-
-String composeSMS(String reason) {
-  String sms = "ALERT: Accident Detected!\n";
-  sms += "Reason: " + reason + "\n";
-  sms += "Orientation: X=" + String(a.acceleration.x, 1) +
-         " Y=" + String(a.acceleration.y, 1) +
-         " Z=" + String(a.acceleration.z, 1) + "\n";
-  sms += "Impact: " + String(sqrt(a.acceleration.x*a.acceleration.x +
-                                 a.acceleration.y*a.acceleration.y +
-                                 a.acceleration.z*a.acceleration.z)/9.8, 2) + "G\n";
-  if (gpsParser.location.isValid()) {
-    sms += "Location: https://maps.google.com/?q=";
-    sms += gpsParser.location.lat();
-    sms += ",";
-    sms += gpsParser.location.lng();
-  } else {
-    sms += "Location: Invalid";
-  }
-  return sms;
-}
-
-void sendSMS(String number, String message) {
-  sim800.println("AT+CMGF=1");
-  delay(500);
-  sim800.println("AT+CMGS=\"" + number + "\"");
-  delay(500);
-  sim800.print(message);
-  sim800.write(26); // Ctrl+Z
-  delay(5000);
-}
-
-void readGPS() {
-  while (gps.available()) {
+  // Process GPS Data
+  while (gps.available() > 0) {
     gpsParser.encode(gps.read());
   }
-}
 
-void readUltrasonic() {
-  long distance = ultrasonic.read();
-  if (distance > 0 && distance < ULTRASONIC_TRIGGER_DISTANCE) {
-    digitalWrite(ESP32CAM_TRIGGER_PIN, HIGH);
-  } else {
-    digitalWrite(ESP32CAM_TRIGGER_PIN, LOW);
-  }
-}
+  // Update GPS Time
+  updateGPSTime();
 
-void updateDisplay() {
-  display.clearDisplay();
-  display.setCursor(0,0);
-  display.print("GPS: ");
-  if (gpsParser.location.isValid()) {
-    display.print(gpsParser.location.lat(), 4);
-    display.print(",");
-    display.print(gpsParser.location.lng(), 4);
-  } else {
-    display.print("No Fix");
+  // Read Accelerometer and Gyro Data only if MPU is available
+  if (mpuAvailable) {
+    sensors_event_t accel, gyro, temp;
+    mpu.getEvent(&accel, &gyro, &temp);
+
+    // Apply Low-Pass Filter to Smooth Data
+    filteredGX = 0.8 * filteredGX + 0.2 * accel.acceleration.x;
+    filteredGY = 0.8 * filteredGY + 0.2 * accel.acceleration.y;
+    filteredGZ = 0.8 * filteredGZ + 0.2 * accel.acceleration.z;
+
+    // Compute Total G-Force
+    totalG = sqrt(filteredGX * filteredGX + filteredGY * filteredGY + filteredGZ * filteredGZ);
+
+    // Detect Car Orientation and Rollover
+    detectCarOrientation(accel, gyro);
   }
 
-  display.setCursor(0,10);
-  display.print("SIM: ");
-  sim800.println("AT+CSQ");
+  // Handle SMS Delay for Accident Detection
+  if (sendSMSAfterDelay && millis() - accidentDetectionTime >= accidentSMSDelay) {
+    sendAccidentAlert(); // Send SMS after delay
+    sendSMSAfterDelay = false; // Reset the flag
+  }
+
+  // Measure Ultrasonic Distance
+  ultrasonicDistance = getUltrasonicDistance();
+
+  // Cycle Between Pages
+  if (millis() - pageCycleTime > pageSwitchInterval) {
+    currentPage = (currentPage == 1) ? 2 : 1; // Toggle between Page 1 and Page 2
+    pageCycleTime = millis(); // Reset the cycle timer
+  }
+
+  // Display the Current Page
+  displayPage(currentPage);
+
   delay(100);
-  while (sim800.available()) {
-    String line = sim800.readStringUntil('\n');
-    if (line.indexOf("+CSQ:") >= 0) {
-      display.print(line);
-    }
-  }
+}
 
-  display.setCursor(0,20);
-  display.print("Ultra: ");
-  display.print(ultrasonic.read());
-  display.print("cm");
+// Function to Disable the Entire System
+void disableSystem() {
+  Serial.println("System Disabled!");
 
-  display.setCursor(0,30);
-  display.print(accidentDetected ? "ACCIDENT!" : "OK");
+  // Turn off all outputs
+  digitalWrite(BUZZER_PIN, LOW);
 
-  display.setCursor(0,40);
-  display.print("Accel: X");
-  display.print(a.acceleration.x, 1);
-  display.print(" Y");
-  display.print(a.acceleration.y, 1);
-  display.print(" Z");
-  display.print(a.acceleration.z, 1);
+  // Display "System Disabled" on OLED
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("System Disabled!");
+  display.display();
 
+  while (1); // Stop the program
+}
+
+// Function to Reset System State
+void resetSystem() {
+  Serial.println("System Reset Triggered!");
+
+  // Reset accident detection flags
+  accidentDetected = false;
+  sendSMSAfterDelay = false;
+  carOrientation = "Upright";
+
+  // Stop the buzzer
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Clear OLED display
+  display.clearDisplay();
   display.display();
 }
 
-void handleRoot() {
-  String html = "<h1>ESP Accident Detection</h1>";
-  html += "<p><a href='/recipients'>Edit Recipients</a></p>";
-  server.send(200, "text/html", html);
+// Function to Trigger Manual Alert (SMS and Buzzer)
+void triggerManualAlert() {
+  Serial.println("Manual Alert Triggered!");
+
+  // Activate the buzzer
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  // Send an SMS alert
+  sendManualSMS();
+
+  // Keep the buzzer on for 5 seconds, then turn it off
+  delay(5000);
+  digitalWrite(BUZZER_PIN, LOW);
 }
 
-void handleRecipients() {
-  if (server.hasArg("num")) {
-    numRecipients = server.arg("num").toInt();
-    if (numRecipients > 5) numRecipients = 5;
-    prefs.putInt("count", numRecipients);
-    for (int i = 0; i < numRecipients; i++) {
-      String key = "num" + String(i);
-      recipientNumbers[i] = server.arg(key);
-      prefs.putString(key.c_str(), recipientNumbers[i]);
+// Function to Detect Car Orientation and Trigger Alerts
+void detectCarOrientation(sensors_event_t &accel, sensors_event_t &gyro) {
+  const float uprightAccelZThreshold = 8.0;
+  const float flippedAccelZThreshold = -8.0;
+  const float sideAccelThreshold = 2.0;
+  const unsigned long positionHoldDuration = 500; // 50ms seconds in milliseconds
+
+  static unsigned long positionStartTime = 0; // Tracks when the position was first detected
+  static String lastDetectedOrientation = "Unknown"; // Tracks the last detected orientation
+
+  // Check Static Orientation with Accelerometer
+  if (filteredGZ > uprightAccelZThreshold) {
+    carOrientation = "Upright";
+    accidentDetected = false;
+    sendSMSAfterDelay = false;
+
+    // Reset position hold timer
+    positionStartTime = 0;
+    lastDetectedOrientation = "Upright";
+
+    // Turn off the buzzer
+    digitalWrite(BUZZER_PIN, LOW);
+  } else if (filteredGZ < flippedAccelZThreshold || fabs(filteredGX) > sideAccelThreshold || fabs(filteredGY) > sideAccelThreshold) {
+    carOrientation = (filteredGZ < flippedAccelZThreshold) ? "Flipped" : "On Side";
+
+    // Check if the orientation is consistent for 30 seconds
+    if (lastDetectedOrientation != carOrientation) {
+      positionStartTime = millis();
+      lastDetectedOrientation = carOrientation;
+    } else if (millis() - positionStartTime >= positionHoldDuration) {
+      accidentDetected = true;
+
+      // Turn on the buzzer
+      digitalWrite(BUZZER_PIN, HIGH);
+
+      // Start the SMS delay timer
+      if (!sendSMSAfterDelay) {
+        accidentDetectionTime = millis();
+        sendSMSAfterDelay = true;
+      }
     }
-    server.send(200, "text/html", "<p>Recipients saved!</p><a href='/'>Back</a>");
+  } else if (totalG > gForceThreshold) { // Check if total G exceeds the threshold
+    carOrientation = "High G-Force Detected";
+
+    // Check if the high G-force is consistent for 30 seconds
+    if (lastDetectedOrientation != carOrientation) {
+      positionStartTime = millis();
+      lastDetectedOrientation = carOrientation;
+    } else if (millis() - positionStartTime >= positionHoldDuration) {
+      accidentDetected = true;
+
+      // Turn on the buzzer
+      digitalWrite(BUZZER_PIN, HIGH);
+
+      // Start the SMS delay timer
+      if (!sendSMSAfterDelay) {
+        accidentDetectionTime = millis();
+        sendSMSAfterDelay = true;
+      }
+    }
   } else {
-    String html = "<form method='get'>";
-    html += "Number of Recipients (1-5): <input name='num' value='" + String(numRecipients) + "'><br>";
-    for (int i = 0; i < 5; i++) {
-      html += "Recipient " + String(i+1) + ": <input name='num" + String(i) + "' value='" + recipientNumbers[i] + "'><br>";
+    carOrientation = "Unknown";
+    accidentDetected = false;
+    sendSMSAfterDelay = false;
+
+    // Reset position hold timer
+    positionStartTime = 0;
+    lastDetectedOrientation = "Unknown";
+
+    // Turn off the buzzer
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+// Function to Initialize MPU6050
+void initializeMPU() {
+  Serial.println("Attempting to initialize MPU6050...");
+  if (mpu.begin()) {
+    mpuAvailable = true;
+    Serial.println("MPU6050 initialized successfully!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
+    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  } else {
+    mpuAvailable = false;
+    Serial.println("MPU6050 not detected. Retrying...");
+    delay(2000); // Retry after 2 seconds
+  }
+}
+
+// Function to Check if SIM800L is Working
+void checkSIM800L() {
+  sim800.println("AT"); // Send AT command
+  delay(1000);
+
+  if (sim800.available()) {
+    String response = sim800.readString();
+    if (response.indexOf("OK") != -1) {
+      sim800Status = "Working";
+    } else {
+      sim800Status = "Not Detected";
     }
-    html += "<input type='submit' value='Save'></form>";
-    server.send(200, "text/html", html);
+  } else {
+    sim800Status = "Not Detected";
+  }
+  Serial.println("SIM800L Status: " + sim800Status);
+}
+
+// Function to Update GPS Time
+void updateGPSTime() {
+  if (gpsParser.time.isValid()) {
+    char timeBuffer[16];
+    sprintf(timeBuffer, "%02d:%02d:%02d", gpsParser.time.hour(), gpsParser.time.minute(), gpsParser.time.second());
+    gpsTime = String("Time: ") + timeBuffer;
+  } else {
+    gpsTime = "Time: Unavailable";
+  }
+}
+
+// Function to Send Manual SMS Alert
+void sendManualSMS() {
+  String latitude = gpsParser.location.isValid() ? String(gpsParser.location.lat(), 6) : "Unavailable";
+  String longitude = gpsParser.location.isValid() ? String(gpsParser.location.lng(), 6) : "Unavailable";
+
+  // Generate Google Maps link
+  String googleMapsLink = "https://www.google.com/maps?q=" + latitude + "," + longitude;
+
+  // Construct the message
+  String alertMessage = String("Manual Alert!\n") +
+                      "Orientation: " + carOrientation + "\n" +
+                      "Location: Latitude: " + latitude + ", Longitude: " + longitude + "\n" +
+                      "Time: " + gpsTime + "\n" +
+                      "View location: " + googleMapsLink;
+
+  // Send the SMS
+  sim800.println("AT+CMGF=1"); // Set SMS to Text Mode
+  delay(100);
+  sim800.println("AT+CMGS=\"+639123456789\""); // Replace with recipient's number
+  delay(100);
+  sim800.print(alertMessage);
+  delay(100);
+  sim800.write(26); // Send Ctrl+Z to indicate the end of the message
+  delay(5000); // Wait for the message to be sent
+
+  // Log the message to Serial
+  Serial.println("SMS Sent: " + alertMessage);
+}
+
+// Function to Send Accident SMS Alert
+void sendAccidentAlert() {
+  String latitude = gpsParser.location.isValid() ? String(gpsParser.location.lat(), 6) : "Unavailable";
+  String longitude = gpsParser.location.isValid() ? String(gpsParser.location.lng(), 6) : "Unavailable";
+
+  // Generate Google Maps link
+  String googleMapsLink = "https://www.google.com/maps?q=" + latitude + "," + longitude;
+
+  // Construct the message
+  String alertMessage = String("Accident Detected!\n") +
+                      "Orientation: " + carOrientation + "\n" +
+                      "Location: Latitude: " + latitude + ", Longitude: " + longitude + "\n" +
+                      "Time: " + gpsTime + "\n" +
+                      "View location: " + googleMapsLink;
+
+  // Send the SMS
+  sim800.println("AT+CMGF=1"); // Set SMS to Text Mode
+  delay(100);
+  sim800.println("AT+CMGS=\"+639123456789\""); // Replace with recipient's number
+  delay(100);
+  sim800.print(alertMessage);
+  delay(100);
+  sim800.write(26); // Send Ctrl+Z to indicate the end of the message
+  delay(5000); // Wait for the message to be sent
+
+  // Log the message to Serial
+  Serial.println("SMS Sent: " + alertMessage);
+}
+
+// Function to Get Ultrasonic Distance
+float getUltrasonicDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) return -1;
+  float distance = duration * 0.034 / 2;
+  if (distance < 2 || distance > 400) return -1;
+  return distance;
+}
+
+// Function to Display the Current Page
+void displayPage(int page) {
+  display.clearDisplay();
+  if (page == 1) {
+    display.setCursor(0, 0);
+    display.print(gpsTime);
+
+    if (gpsParser.location.isValid()) {
+      display.setCursor(0, 10);
+      display.print("GPS: Lat ");
+      display.print(gpsParser.location.lat(), 2);
+      display.print(", Lng ");
+      display.print(gpsParser.location.lng(), 2);
+    } else {
+      display.setCursor(0, 10);
+      display.print("GPS: Unavailable");
+    }
+
+    display.setCursor(0, 20);
+    display.print("SIM800L: ");
+    display.print(sim800Status);
+
+    display.setCursor(0, 30);
+    display.print("Orientation: ");
+    display.print(carOrientation);
+
+  } else if (page == 2) {
+    display.setCursor(0, 0);
+    display.print("Total G: ");
+    display.print(totalG, 2);
+
+    display.setCursor(0, 10);
+    display.print("Distance: ");
+    display.print(ultrasonicDistance, 2);
+    display.print(" cm");
+
+    display.setCursor(0, 20);
+    display.print("Accident: ");
+    display.print(accidentDetected ? "YES" : "NO");
+  }
+  display.display();
+}
+
+// Function to Send Trigger Signal to ESP32-CAM
+void sendTriggerToESP32CAM() {
+  // Example data to send to ESP32-CAM
+  String triggerMessage = "START_RECORDING";
+
+  // Replace with ESP32-CAM's IP address (when connected to this ESP32's AP)
+  IPAddress esp32CamIP(192, 168, 4, 2); // Example IP address
+  uint16_t esp32CamPort = 8080; // Example port where ESP32-CAM listens
+
+  // Create a UDP object for sending the message
+  WiFiUDP udp;
+  udp.beginPacket(esp32CamIP, esp32CamPort);
+  udp.print(triggerMessage);
+  if (udp.endPacket()) {
+    Serial.println("Trigger signal sent to ESP32-CAM.");
+  } else {
+    Serial.println("Failed to send trigger signal to ESP32-CAM.");
+  }
+}
+
+// Function to Respond to Web Command for Triggering ESP32-CAM
+void setupTriggerEndpoint() {
+  server.on("/trigger-esp32cam", []() {
+    sendTriggerToESP32CAM();
+    server.send(200, "text/plain", "Trigger signal sent to ESP32-CAM.");
+  });
+}
+
+// Call this function in setup() to set up the trigger endpoint
+void setupTriggerFunctionality() {
+  setupTriggerEndpoint();
+}
+
+// Function to Check Distance and Send Trigger if Below 2 Meters
+void sendTriggerIfBelowTwoMeters() {
+  float distance = getUltrasonicDistance(); // Measure Ultrasonic Distance
+
+  if (distance > 0 && distance < 200) { // Check if distance is below 2 meters (200 cm)
+    sendTriggerToESP32CAM(); // Call the function to send the trigger signal
+    Serial.println("Trigger sent to ESP32-CAM as distance is below 2 meters.");
+    delay(3000); // Prevent rapid retriggering
+  }
+}
+
+// Function to Monitor UDP Transmission
+void monitorUDPTransmission(const char *command, const IPAddress &esp32CamIP, uint16_t esp32CamPort) {
+  WiFiUDP udp;
+  udp.beginPacket(esp32CamIP, esp32CamPort);
+  udp.print(command);
+
+  if (udp.endPacket()) { // Successfully sent packet
+    Serial.println("UDP Command Sent:");
+    Serial.print("Command: ");
+    Serial.println(command);
+    Serial.print("Target IP: ");
+    Serial.println(esp32CamIP);
+    Serial.print("Target Port: ");
+    Serial.println(esp32CamPort);
+  } else { // Failed to send packet
+    Serial.println("Failed to send UDP Command.");
+    Serial.print("Command: ");
+    Serial.println(command);
+    Serial.print("Target IP: ");
+    Serial.println(esp32CamIP);
+    Serial.print("Target Port: ");
+    Serial.println(esp32CamPort);
   }
 }
