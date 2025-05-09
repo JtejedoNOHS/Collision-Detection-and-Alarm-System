@@ -44,14 +44,6 @@ Preferences preferences;
 // TinyGPS++ Object
 TinyGPSPlus gpsParser;
 
-// ESP-NOW Data Structure
-typedef struct {
-  bool recordVideo; // True if ESP32-CAM should start recording
-} esp_now_message_t;
-
-// ESP32-CAM MAC Address (replace with the actual MAC address of your ESP32-CAM)
-uint8_t esp32camAddress[] = {0x24, 0x6F, 0x28, 0xXX, 0xXX, 0xXX};
-
 // Variables
 float filteredGX = 0, filteredGY = 0, filteredGZ = 0;
 float totalG, ultrasonicDistance = 0;
