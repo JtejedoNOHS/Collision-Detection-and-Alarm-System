@@ -1,0 +1,195 @@
+# ESP32 Accident Detection System
+
+The **ESP32 Accident Detection System** is a comprehensive IoT-based solution for vehicle accident detection. It combines sensors, GPS, a GSM module, and an OLED display to monitor vehicle orientation, detect accidents, and notify emergency contacts with real-time location data. The system also features a reset button and buzzer for additional functionalities.
+
+---
+
+## Features
+1. **Accident Detection**:
+    - Detects accidents based on G-force (MPU6050 accelerometer and gyroscope) and vehicle orientation.
+    - Triggers alerts for events such as flipping or abnormal orientation.
+
+2. **SMS Notifications**:
+    - Sends real-time SMS alerts via the SIM800L GSM module.
+    - Includes a clickable Google Maps link for the accident location.
+
+3. **GPS Integration**:
+    - Tracks vehicle location using a GPS module.
+    - Provides latitude, longitude, and timestamp in notifications.
+
+4. **OLED Display**:
+    - Shows system status, orientation, GPS data, and accident detection information.
+
+5. **Ultrasonic Sensor**:
+    - Monitors proximity or distance for potential additional functionalities.
+
+6. **Buzzer and Reset Button**:
+    - Audible buzzer alerts during an accident.
+    - Reset button to stop alerts and reset system status.
+
+7. **Wi-Fi Access Point**:
+    - Configures the ESP32 as a Wi-Fi access point for web-based monitoring.
+
+---
+
+## Components Used
+1. **ESP32 Microcontroller**:
+    - Main control unit for the system.
+
+2. **MPU6050**:
+    - Accelerometer and gyroscope module for accident detection.
+
+3. **SIM800L GSM Module**:
+    - Sends SMS alerts to predefined numbers.
+
+4. **TinyGPS++**:
+    - GPS module for tracking latitude and longitude.
+
+5. **HC-SR04 Ultrasonic Sensor**:
+    - Measures distance for proximity alerts.
+
+6. **OLED Display**:
+    - Displays system status and updates.
+
+7. **Buzzer and Reset Button**:
+    - Enhances the interactivity of the system.
+
+---
+
+## How It Works
+### **Accident Detection**
+1. The **MPU6050** detects the orientation and G-force of the vehicle.
+2. If the G-force exceeds a threshold or the vehicle flips:
+   - The buzzer is activated.
+   - An SMS alert is sent with the accident details and location.
+
+### **SMS Alerts**
+- SMS includes:
+  - Vehicle orientation (e.g., Flipped, On Side, Upright).
+  - GPS coordinates (latitude and longitude).
+  - Timestamp.
+  - Google Maps link for easy navigation to the accident site.
+
+### **Reset System**
+- Press the **reset button** to:
+  - Stop the buzzer.
+  - Clear accident flags and reset the system.
+
+### **OLED Display**
+- Displays real-time information:
+  - GPS data (latitude, longitude, and timestamp).
+  - SIM800L status.
+  - Vehicle orientation.
+  - Accident detection status.
+
+---
+
+## Installation
+### **Hardware Setup**
+1. Connect the components as follows:
+   - **MPU6050**: Connect to I2C pins of ESP32.
+   - **SIM800L**:
+     - RX to ESP32 TX pin (e.g., GPIO 16).
+     - TX to ESP32 RX pin (e.g., GPIO 17).
+   - **GPS Module**:
+     - RX to ESP32 TX (e.g., GPIO 4).
+     - TX to ESP32 RX (e.g., GPIO 5).
+   - **HC-SR04**:
+     - Trig to GPIO 12.
+     - Echo to GPIO 13.
+   - **Buzzer**: Connect to GPIO 25.
+   - **Reset Button**: Connect to GPIO 26 with a pull-up resistor.
+   - **OLED Display**: Connect to I2C pins.
+
+2. Ensure proper power supply for all components, especially the SIM800L, which requires 4.2V.
+
+### **Software Setup**
+1. Install the following Arduino libraries:
+   - Adafruit SSD1306
+   - Adafruit MPU6050
+   - Adafruit Sensor
+   - TinyGPS++
+   - Preferences (built-in)
+
+2. Upload the provided code to the ESP32 using the Arduino IDE.
+
+3. Configure the recipient phone number in the code:
+   ```cpp
+   String recipientNumber = "+639123456789"; // Replace with your phone number
+   ```
+
+---
+
+## Usage
+1. Power on the system.
+2. The OLED will display system status, GPS location, and orientation.
+3. If an accident is detected:
+   - The buzzer will sound.
+   - An SMS alert will be sent to the configured phone number.
+4. Press the reset button to stop the buzzer and reset the system.
+
+---
+
+## Code Overview
+### **Key Functions**
+1. **Accident Detection**:
+   - Detects accidents based on G-force and orientation thresholds.
+2. **Send SMS Alerts**:
+   - Sends SMS with accident details, GPS data, and Google Maps link.
+3. **Reset System**:
+   - Resets the system state and stops the buzzer.
+4. **Ultrasonic Distance Measurement**:
+   - Measures distance for additional proximity-based features.
+
+### **SMS Format**
+```plaintext
+Accident Detected!
+Orientation: Flipped
+Location: Latitude: 14.5995, Longitude: 120.9842
+Time: 13:10:58
+View location: https://www.google.com/maps?q=14.5995,120.9842
+```
+
+---
+
+## Troubleshooting
+1. **MPU6050 Not Detected**:
+   - Ensure proper wiring to I2C pins.
+   - The code retries initialization every 2 seconds.
+
+2. **SIM800L Not Responding**:
+   - Check power supply (4.2V recommended).
+   - Verify TX/RX connections.
+
+3. **No GPS Data**:
+   - Ensure the GPS module has a clear line of sight to the sky.
+   - Wait for GPS to acquire satellite signals.
+
+4. **Buzzer Doesn't Stop**:
+   - Press the reset button firmly.
+   - Ensure the button is connected correctly.
+
+---
+
+## Future Improvements
+1. **Add Dynamic Thresholds**:
+   - Adjust G-force thresholds based on vehicle type or road conditions.
+
+2. **Integrate Cloud Services**:
+   - Send accident data to a cloud platform for centralized monitoring.
+
+3. **Add Video Logging**:
+   - Use an ESP32-CAM to record video during accidents.
+
+4. **Solar Power**:
+   - Enable off-grid operation with a solar-powered battery system.
+
+---
+
+## License
+This project is licensed under the MIT License. Feel free to use, modify, and distribute the code.
+
+---
+
+## Contact
+For questions or contributions, contact **@JtejedoNOHS**.
