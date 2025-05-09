@@ -490,3 +490,39 @@ void setupTriggerEndpoint() {
 void setupTriggerFunctionality() {
   setupTriggerEndpoint();
 }
+
+// Function to Check Distance and Send Trigger if Below 2 Meters
+void sendTriggerIfBelowTwoMeters() {
+  float distance = getUltrasonicDistance(); // Measure Ultrasonic Distance
+
+  if (distance > 0 && distance < 200) { // Check if distance is below 2 meters (200 cm)
+    sendTriggerToESP32CAM(); // Call the function to send the trigger signal
+    Serial.println("Trigger sent to ESP32-CAM as distance is below 2 meters.");
+    delay(1000); // Prevent rapid retriggering
+  }
+}
+
+// Function to Monitor UDP Transmission
+void monitorUDPTransmission(const char *command, const IPAddress &esp32CamIP, uint16_t esp32CamPort) {
+  WiFiUDP udp;
+  udp.beginPacket(esp32CamIP, esp32CamPort);
+  udp.print(command);
+
+  if (udp.endPacket()) { // Successfully sent packet
+    Serial.println("UDP Command Sent:");
+    Serial.print("Command: ");
+    Serial.println(command);
+    Serial.print("Target IP: ");
+    Serial.println(esp32CamIP);
+    Serial.print("Target Port: ");
+    Serial.println(esp32CamPort);
+  } else { // Failed to send packet
+    Serial.println("Failed to send UDP Command.");
+    Serial.print("Command: ");
+    Serial.println(command);
+    Serial.print("Target IP: ");
+    Serial.println(esp32CamIP);
+    Serial.print("Target Port: ");
+    Serial.println(esp32CamPort);
+  }
+}
