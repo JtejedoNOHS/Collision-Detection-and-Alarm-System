@@ -1,302 +1,245 @@
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Preferences.h>
 #include <TinyGPS++.h>
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
 
-// OLED Display Pins and Config
+// OLED Display
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// MPU6050 Config
+// MPU6050 Accelerometer and Gyro
 Adafruit_MPU6050 mpu;
-bool mpuAvailable = false;
 
 // Ultrasonic Sensor Pins
 #define TRIG_PIN 12
 #define ECHO_PIN 13
 
-// Buzzer and Buttons
+// Buzzer and Button
 #define BUZZER_PIN 25
 #define RESET_PIN 26
 
-// GSM Module and GPS using Hardware Serial
+// GSM & GPS UART
+HardwareSerial sim800(1);
+HardwareSerial gps(2);
 #define SIM800_RX 16
 #define SIM800_TX 17
 #define GPS_RX 4
 #define GPS_TX 5
-TinyGPSPlus gpsData;
 
-// Define hardware serial ports
-HardwareSerial sim800(1); // Using Serial1 for GSM
-HardwareSerial gps(2);    // Using Serial2 for GPS
+// WiFi AP
+const char *ssid = "ESP32-Accident-System";
+const char *password = "12345678";
 
-// WiFi and Web Server Config
-const char* ssid = "ESP32_AP";
-const char* password = "password123";
+// Web server
 WebServer server(80);
+Preferences preferences;
+TinyGPSPlus gpsParser;
 
-// UDP Config for ESP32-CAM Communication
-WiFiUDP udp;
-const char* esp32CamIP = "192.168.4.2";
-const int esp32CamPort = 8888;
+// Configurable ESP32-CAM IP
+IPAddress esp32CamIP(192, 168, 4, 2);
+uint16_t esp32CamPort = 8080;
 
-// Global State Variables
-double impactThreshold = 2.5; // Threshold for high G-forces
+// Variables
+float filteredGX = 0, filteredGY = 0, filteredGZ = 0, totalG = 0;
 bool accidentDetected = false;
-unsigned long accidentStartTime = 0;
-String recipientNumbers[5] = {"09171234567"}; // Dynamic editable via Web Server
-int recipientCount = 1;
+bool sendSMSAfterDelay = false;
+unsigned long accidentDetectionTime = 0;
+float gForceThreshold = 3.0; // Default threshold
+String carOrientation = "Upright";
+String phoneNumber;
 
-// Display Page Variables
+// Timers
+unsigned long pageCycleTime = 0;
+const unsigned long pageSwitchInterval = 5000;
 int currentPage = 1;
-unsigned long lastPageSwitchTime = 0;
-const unsigned long pageSwitchInterval = 5000; // Switch pages every 5 seconds
-
-// Function Prototypes
-void setupOLED();
-void setupMPU();
-void setupUltrasonic();
-void setupGSM();
-void setupGPS();
-void setupWiFi();
-void setupWebServer();
-void checkMPU();
-void checkUltrasonic();
-void sendAccidentAlert();
-void triggerESP32CamRecording();
-void handleResetButton();
-void handleWebRequests();
-void updateDisplay();
-void displayPage1();
-void displayPage2();
 
 void setup() {
+  // Serial Monitor
   Serial.begin(115200);
 
-  // Initialize Components
-  setupOLED();
-  setupMPU();
-  setupUltrasonic();
-  setupGSM();
-  setupGPS();
-  setupWiFi();
-  setupWebServer();
+  // Initialize OLED Display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed!");
+    while (1);
+  }
+  display.clearDisplay();
 
-  // Start Web Server
+  // Initialize MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 Failed!");
+    while (1);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+
+  // Initialize Pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RESET_PIN, INPUT_PULLUP);
+
+  // Initialize SIM800L
+  sim800.begin(9600, SERIAL_8N1, SIM800_RX, SIM800_TX);
+
+  // Initialize GPS
+  gps.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
+
+  // Retrieve Phone Number and Threshold from Preferences
+  preferences.begin("config", false);
+  phoneNumber = preferences.getString("phone", "+639287523354");
+  gForceThreshold = preferences.getFloat("gForce", 3.0);
+
+  // Setup WiFi AP
+  WiFi.softAP(ssid, password);
+  if (MDNS.begin("esp32")) {
+    Serial.println("MDNS responder started. Access via http://esp32.local");
+  }
+
+  // Setup Web Server
+  server.on("/", handleRootPage);
+  server.on("/update-config", handleUpdateConfig);
+  server.on("/trigger-esp32cam", []() {
+    sendTriggerToESP32CAM();
+    server.send(200, "text/plain", "Trigger signal sent to ESP32-CAM.");
+  });
   server.begin();
 }
 
 void loop() {
-  server.handleClient(); // Handle Web Server Requests
-  checkMPU();            // Check MPU6050 for Accidents
-  checkUltrasonic();     // Check Ultrasonic Sensor
-  handleResetButton();   // Handle Reset Button Actions
-  updateDisplay();       // Update OLED Display
-}
+  server.handleClient();
 
-// OLED Setup
-void setupOLED() {
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED initialization failed!");
-    while (1);
+  // Handle GPS Data
+  while (gps.available() > 0) {
+    gpsParser.encode(gps.read());
   }
-  display.clearDisplay();
-  display.display();
-  Serial.println("OLED initialized successfully.");
-}
 
-// MPU6050 Setup
-void setupMPU() {
-  if (!mpu.begin()) {
-    Serial.println("MPU6050 initialization failed!");
-    mpuAvailable = false;
-  } else {
-    mpuAvailable = true;
-    Serial.println("MPU6050 initialized successfully.");
+  // Handle MPU6050 Data
+  sensors_event_t accel, gyro, temp;
+  mpu.getEvent(&accel, &gyro, &temp);
+  filteredGX = 0.8 * filteredGX + 0.2 * accel.acceleration.x;
+  filteredGY = 0.8 * filteredGY + 0.2 * accel.acceleration.y;
+  filteredGZ = 0.8 * filteredGZ + 0.2 * accel.acceleration.z;
+  totalG = sqrt(filteredGX * filteredGX + filteredGY * filteredGY + filteredGZ * filteredGZ);
+
+  detectCarOrientation(accel);
+
+  // Accident Detection SMS
+  if (sendSMSAfterDelay && millis() - accidentDetectionTime >= 5000) {
+    sendSMS(false);
+    sendSMSAfterDelay = false;
   }
+
+  // Display Pages
+  if (millis() - pageCycleTime > pageSwitchInterval) {
+    currentPage = (currentPage == 1) ? 2 : 1;
+    pageCycleTime = millis();
+  }
+  displayPage(currentPage);
+
+  delay(100);
 }
 
-// Ultrasonic Sensor Setup
-void setupUltrasonic() {
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-}
+void detectCarOrientation(sensors_event_t &accel) {
+  const float uprightZ = 8.0, flippedZ = -8.0, sideAccel = 2.0;
 
-// GSM Setup
-void setupGSM() {
-  sim800.begin(9600, SERIAL_8N1, SIM800_RX, SIM800_TX);
-  Serial.println("GSM initialized on Serial1.");
-  // Register SIM card logic here...
-}
-
-// GPS Setup
-void setupGPS() {
-  gps.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-  Serial.println("GPS initialized on Serial2.");
-}
-
-// WiFi Setup
-void setupWiFi() {
-  WiFi.softAP(ssid, password);
-  Serial.print("WiFi Access Point started. IP: ");
-  Serial.println(WiFi.softAPIP());
-}
-
-// Web Server Setup
-void setupWebServer() {
-  server.on("/", HTTP_GET, []() {
-    server.send(200, "text/plain", "Welcome to the ESP32 Accident Detection System");
-  });
-  server.on("/addRecipient", HTTP_POST, []() {
-    if (server.hasArg("number")) {
-      if (recipientCount < 5) {
-        recipientNumbers[recipientCount++] = server.arg("number");
-        server.send(200, "text/plain", "Recipient added successfully");
-      } else {
-        server.send(400, "text/plain", "Recipient list full");
-      }
-    } else {
-      server.send(400, "text/plain", "Invalid request");
-    }
-  });
-}
-
-// Check MPU6050 for Accidents
-void checkMPU() {
-  if (!mpuAvailable) return;
-
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
-
-  double mag = sqrt(a.acceleration.x * a.acceleration.x +
-                    a.acceleration.y * a.acceleration.y +
-                    a.acceleration.z * a.acceleration.z);
-
-  if (mag >= impactThreshold) {
-    accidentDetected = true;
-    accidentStartTime = millis();
-    sendAccidentAlert();
-    triggerESP32CamRecording();
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(5000); // Delay before resetting
+  if (filteredGZ > uprightZ) {
+    carOrientation = "Upright";
+    accidentDetected = false;
+    sendSMSAfterDelay = false;
     digitalWrite(BUZZER_PIN, LOW);
+  } else if (filteredGZ < flippedZ || fabs(filteredGX) > sideAccel || fabs(filteredGY) > sideAccel) {
+    carOrientation = (filteredGZ < flippedZ) ? "Flipped" : "On Side";
+    triggerAccident();
+  } else if (totalG > gForceThreshold) {
+    carOrientation = "High G-Force";
+    triggerAccident();
   }
 }
 
-// Check Ultrasonic Sensor
-void checkUltrasonic() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH);
-  float distance = (duration / 2) * 0.0343; // Calculate distance in cm
-
-  if (distance < 50) {
-    triggerESP32CamRecording();
+void triggerAccident() {
+  accidentDetected = true;
+  digitalWrite(BUZZER_PIN, HIGH);
+  if (!sendSMSAfterDelay) {
+    accidentDetectionTime = millis();
+    sendSMSAfterDelay = true;
   }
 }
 
-// Send Accident Alert via GSM
-void sendAccidentAlert() {
-  String message = "Accident detected! Location: ";
-  message += "https://maps.google.com/?q=" + String(gpsData.location.lat(), 6) + "," + String(gpsData.location.lng(), 6);
-  
-  for (int i = 0; i < recipientCount; i++) {
-    sim800.println("AT+CMGS=\"" + recipientNumbers[i] + "\"");
-    delay(100);
-    sim800.println(message);
-    delay(100);
-    sim800.write(26); // End SMS with CTRL+Z
-    delay(5000);
-  }
+void sendSMS(bool manual) {
+  String lat = gpsParser.location.isValid() ? String(gpsParser.location.lat(), 6) : "Unavailable";
+  String lng = gpsParser.location.isValid() ? String(gpsParser.location.lng(), 6) : "Unavailable";
+  String link = "https://www.google.com/maps?q=" + lat + "," + lng;
+  String msg = (manual ? "Manual Alert!\n" : "Accident Detected!\n") + "Location: " + lat + ", " + lng + "\nLink: " + link;
+
+  sim800.println("AT+CMGF=1");
+  delay(100);
+  sim800.println("AT+CMGS=\"" + phoneNumber + "\"");
+  delay(100);
+  sim800.print(msg);
+  sim800.write(26);
 }
 
-// Trigger ESP32-CAM Recording
-void triggerESP32CamRecording() {
+void displayPage(int page) {
+  display.clearDisplay();
+  if (page == 1) {
+    display.setCursor(0, 0);
+    display.print("Orientation: ");
+    display.print(carOrientation);
+    display.setCursor(0, 10);
+    display.print("Total G: ");
+    display.print(totalG, 2);
+  } else {
+    display.setCursor(0, 0);
+    display.print("WiFi: ");
+    display.print(WiFi.softAPIP());
+  }
+  display.display();
+}
+
+void sendTriggerToESP32CAM() {
+  WiFiUDP udp;
   udp.beginPacket(esp32CamIP, esp32CamPort);
   udp.print("START_RECORDING");
   udp.endPacket();
 }
 
-// Handle Reset Button
-void handleResetButton() {
-  static unsigned long buttonPressTime = 0;
-  static int buttonPressCount = 0;
-
-  if (digitalRead(RESET_PIN) == LOW) {
-    if (buttonPressTime == 0) {
-      buttonPressTime = millis();
-    } else if (millis() - buttonPressTime > 15000) {
-      ESP.restart();
-    }
-  } else {
-    if (buttonPressTime != 0 && millis() - buttonPressTime < 500) {
-      buttonPressCount++;
-      if (buttonPressCount == 2) {
-        accidentDetected = true;
-        sendAccidentAlert();
-      }
-    }
-    buttonPressTime = 0;
-    buttonPressCount = 0;
-  }
+void handleRootPage() {
+  String html = R"rawliteral(
+    <!DOCTYPE html>
+    <html>
+    <head><title>ESP32 Configuration</title></head>
+    <body>
+      <h1>ESP32 Configuration</h1>
+      <form action="/update-config" method="POST">
+        <label for="phone">Phone Number:</label><br>
+        <input type="text" id="phone" name="phone" value=")rawliteral" +
+                  phoneNumber + R"rawliteral("><br><br>
+        <label for="gForce">G-Force Threshold:</label><br>
+        <input type="number" id="gForce" name="gForce" step="0.1" value=")rawliteral" +
+                  String(gForceThreshold) + R"rawliteral("><br><br>
+        <input type="submit" value="Update">
+      </form>
+    </body>
+    </html>
+  )rawliteral";
+  server.send(200, "text/html", html);
 }
 
-// Update OLED Display
-void updateDisplay() {
-  unsigned long currentTime = millis();
-
-  // Switch pages based on time
-  if (currentTime - lastPageSwitchTime >= pageSwitchInterval) {
-    currentPage = (currentPage == 1) ? 2 : 1;
-    lastPageSwitchTime = currentTime;
+void handleUpdateConfig() {
+  if (server.hasArg("phone")) {
+    phoneNumber = server.arg("phone");
+    preferences.putString("phone", phoneNumber);
   }
-
-  // Display the current page
-  if (currentPage == 1) {
-    displayPage1();
-  } else {
-    displayPage2();
+  if (server.hasArg("gForce")) {
+    gForceThreshold = server.arg("gForce").toFloat();
+    preferences.putFloat("gForce", gForceThreshold);
   }
-}
-
-// Page 1: GPS, Signal, and Distance
-void displayPage1() {
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print("Page 1: GPS Data");
-  display.setCursor(0, 10);
-  display.print("Lat: ");
-  display.println(gpsData.location.lat(), 6);
-  display.setCursor(0, 20);
-  display.print("Lon: ");
-  display.println(gpsData.location.lng(), 6);
-  display.setCursor(0, 30);
-  display.print("Signal: OK"); // Add signal status checking
-  display.setCursor(0, 40);
-  display.print("Distance: N/A"); // Add ultrasonic distance data
-  display.display();
-}
-
-// Page 2: Telemetry
-void displayPage2() {
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print("Page 2: Telemetry");
-  display.setCursor(0, 10);
-  display.print("Accident: ");
-  display.println(accidentDetected ? "YES" : "NO");
-  display.setCursor(0, 20);
-  display.print("Threshold: ");
-  display.println(impactThreshold);
-  display.setCursor(0, 30);
-  display.print("Impact Time: ");
-  display.println(accidentStartTime);
-  display.display();
+  server.send(200, "text/plain", "Configuration updated. Please go back.");
 }
