@@ -44,6 +44,14 @@ Preferences preferences;
 // TinyGPS++ Object
 TinyGPSPlus gpsParser;
 
+// ESP-NOW Data Structure
+typedef struct {
+  bool recordVideo; // True if ESP32-CAM should start recording
+} esp_now_message_t;
+
+// ESP32-CAM MAC Address (replace with the actual MAC address of your ESP32-CAM)
+uint8_t esp32camAddress[] = {0x24, 0x6F, 0x28, 0xXX, 0xXX, 0xXX};
+
 // Variables
 float filteredGX = 0, filteredGY = 0, filteredGZ = 0;
 float totalG, ultrasonicDistance = 0;
@@ -53,12 +61,14 @@ String gpsTime = "Time: Unavailable";
 bool accidentDetected = false;
 String carOrientation = "Upright";
 String sim800Status = "Checking...";
+bool espNowInitialized = false;
+
 
 // Timer Variables for Reset Button
 unsigned long resetButtonPressTime = 0;
 unsigned long resetButtonReleaseTime = 0; // To track release time for short press
 const unsigned long resetHoldDuration = 30000; // 30 seconds
-const unsigned long shortPressDuration = 5000; // 500 milliseconds for short press detection
+const unsigned long shortPressDuration = 500; // 500 milliseconds for short press detection
 
 // Timer Variables for Accident SMS Delay
 const unsigned long accidentSMSDelay = 5000; // 5 seconds
@@ -112,7 +122,7 @@ void setup() {
   // Configure Wi-Fi Access Point
   WiFi.softAP(ssid, password);
   Serial.println("AP IP Address: " + WiFi.softAPIP().toString());
-
+  
   // Configure Web Server
   server.on("/", []() {
     String html = "<h1>ESP32 Accident Detection System</h1>";
@@ -179,6 +189,17 @@ void loop() {
 
   // Measure Ultrasonic Distance
   ultrasonicDistance = getUltrasonicDistance();
+
+  // If distance is between 2 and 3 meters, send message to ESP32-CAM
+  if (ultrasonicDistance >= 200 && ultrasonicDistance <= 300) {
+    message.recordVideo = true; // Set the recording flag
+    esp_err_t result = esp_now_send(esp32camAddress, (uint8_t *)&message, sizeof(message));
+    if (result == ESP_OK) {
+      Serial.println("Instruction sent to ESP32-CAM to start recording.");
+    } else {
+      Serial.println("Error sending message to ESP32-CAM.");
+    }
+  }
 
   // Cycle Between Pages
   if (millis() - pageCycleTime > pageSwitchInterval) {
