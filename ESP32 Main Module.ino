@@ -44,6 +44,14 @@ Preferences preferences;
 // TinyGPS++ Object
 TinyGPSPlus gpsParser;
 
+// ESP-NOW Data Structure
+typedef struct {
+  bool recordVideo; // True if ESP32-CAM should start recording
+} esp_now_message_t;
+
+// ESP32-CAM MAC Address (replace with the actual MAC address of your ESP32-CAM)
+uint8_t esp32camAddress[] = {0x24, 0x6F, 0x28, 0xXX, 0xXX, 0xXX};
+
 // Variables
 float filteredGX = 0, filteredGY = 0, filteredGZ = 0;
 float totalG, ultrasonicDistance = 0;
@@ -53,12 +61,14 @@ String gpsTime = "Time: Unavailable";
 bool accidentDetected = false;
 String carOrientation = "Upright";
 String sim800Status = "Checking...";
+bool espNowInitialized = false;
+
 
 // Timer Variables for Reset Button
 unsigned long resetButtonPressTime = 0;
 unsigned long resetButtonReleaseTime = 0; // To track release time for short press
 const unsigned long resetHoldDuration = 30000; // 30 seconds
-const unsigned long shortPressDuration = 5000; // 500 milliseconds for short press detection
+const unsigned long shortPressDuration = 500; // 500 milliseconds for short press detection
 
 // Timer Variables for Accident SMS Delay
 const unsigned long accidentSMSDelay = 5000; // 5 seconds
@@ -106,13 +116,13 @@ void setup() {
 
   // Initialize Preferences
   preferences.begin("sms-config", false);
-  String recipientNumber = preferences.getString("phone", "+639287523354" );
+  String recipientNumber = preferences.getString("phone", "+639123456789");
   Serial.println("Loaded phone number: " + recipientNumber);
 
   // Configure Wi-Fi Access Point
   WiFi.softAP(ssid, password);
   Serial.println("AP IP Address: " + WiFi.softAPIP().toString());
-
+  
   // Configure Web Server
   server.on("/", []() {
     String html = "<h1>ESP32 Accident Detection System</h1>";
@@ -180,6 +190,17 @@ void loop() {
   // Measure Ultrasonic Distance
   ultrasonicDistance = getUltrasonicDistance();
 
+  // If distance is between 2 and 3 meters, send message to ESP32-CAM
+  if (ultrasonicDistance >= 200 && ultrasonicDistance <= 300) {
+    message.recordVideo = true; // Set the recording flag
+    esp_err_t result = esp_now_send(esp32camAddress, (uint8_t *)&message, sizeof(message));
+    if (result == ESP_OK) {
+      Serial.println("Instruction sent to ESP32-CAM to start recording.");
+    } else {
+      Serial.println("Error sending message to ESP32-CAM.");
+    }
+  }
+
   // Cycle Between Pages
   if (millis() - pageCycleTime > pageSwitchInterval) {
     currentPage = (currentPage == 1) ? 2 : 1; // Toggle between Page 1 and Page 2
@@ -245,10 +266,6 @@ void detectCarOrientation(sensors_event_t &accel, sensors_event_t &gyro) {
   const float uprightAccelZThreshold = 8.0;
   const float flippedAccelZThreshold = -8.0;
   const float sideAccelThreshold = 2.0;
-  const unsigned long positionHoldDuration = 500; // 50ms seconds in milliseconds
-
-  static unsigned long positionStartTime = 0; // Tracks when the position was first detected
-  static String lastDetectedOrientation = "Unknown"; // Tracks the last detected orientation
 
   // Check Static Orientation with Accelerometer
   if (filteredGZ > uprightAccelZThreshold) {
@@ -256,63 +273,30 @@ void detectCarOrientation(sensors_event_t &accel, sensors_event_t &gyro) {
     accidentDetected = false;
     sendSMSAfterDelay = false;
 
-    // Reset position hold timer
-    positionStartTime = 0;
-    lastDetectedOrientation = "Upright";
-
     // Turn off the buzzer
     digitalWrite(BUZZER_PIN, LOW);
   } else if (filteredGZ < flippedAccelZThreshold || fabs(filteredGX) > sideAccelThreshold || fabs(filteredGY) > sideAccelThreshold) {
     carOrientation = (filteredGZ < flippedAccelZThreshold) ? "Flipped" : "On Side";
+    accidentDetected = true;
 
-    // Check if the orientation is consistent for 30 seconds
-    if (lastDetectedOrientation != carOrientation) {
-      positionStartTime = millis();
-      lastDetectedOrientation = carOrientation;
-    } else if (millis() - positionStartTime >= positionHoldDuration) {
-      accidentDetected = true;
+    // Turn on the buzzer
+    digitalWrite(BUZZER_PIN, HIGH);
 
-      // Turn on the buzzer
-      digitalWrite(BUZZER_PIN, HIGH);
-
-      // Start the SMS delay timer
-      if (!sendSMSAfterDelay) {
-        accidentDetectionTime = millis();
-        sendSMSAfterDelay = true;
-      }
-    }
-  } else if (totalG > gForceThreshold) { // Check if total G exceeds the threshold
-    carOrientation = "High G-Force Detected";
-
-    // Check if the high G-force is consistent for 30 seconds
-    if (lastDetectedOrientation != carOrientation) {
-      positionStartTime = millis();
-      lastDetectedOrientation = carOrientation;
-    } else if (millis() - positionStartTime >= positionHoldDuration) {
-      accidentDetected = true;
-
-      // Turn on the buzzer
-      digitalWrite(BUZZER_PIN, HIGH);
-
-      // Start the SMS delay timer
-      if (!sendSMSAfterDelay) {
-        accidentDetectionTime = millis();
-        sendSMSAfterDelay = true;
-      }
+    // Start the SMS delay timer
+    if (!sendSMSAfterDelay) {
+      accidentDetectionTime = millis();
+      sendSMSAfterDelay = true;
     }
   } else {
     carOrientation = "Unknown";
     accidentDetected = false;
     sendSMSAfterDelay = false;
 
-    // Reset position hold timer
-    positionStartTime = 0;
-    lastDetectedOrientation = "Unknown";
-
     // Turn off the buzzer
     digitalWrite(BUZZER_PIN, LOW);
   }
 }
+
 // Function to Initialize MPU6050
 void initializeMPU() {
   Serial.println("Attempting to initialize MPU6050...");
@@ -328,50 +312,22 @@ void initializeMPU() {
   }
 }
 
+// Function to Check if SIM800L is Working
 void checkSIM800L() {
-  // Send AT command and check response
-  sim800.println("AT");
+  sim800.println("AT"); // Send AT command
   delay(1000);
+
   if (sim800.available()) {
     String response = sim800.readString();
     if (response.indexOf("OK") != -1) {
-      Serial.println("AT Command Response: OK");
+      sim800Status = "Working";
     } else {
-      Serial.println("AT Command Response: Not Detected");
+      sim800Status = "Not Detected";
     }
   } else {
-    Serial.println("AT Command Response: No Response");
+    sim800Status = "Not Detected";
   }
-
-  // Send AT+CSQ to check signal quality
-  sim800.println("AT+CSQ");
-  delay(1000);
-  if (sim800.available()) {
-    String response = sim800.readString();
-    Serial.println("Signal Quality Response: " + response);
-  } else {
-    Serial.println("Signal Quality Response: No Response");
-  }
-
-  // Send AT+COPS? to check operator
-  sim800.println("AT+COPS?");
-  delay(1000);
-  if (sim800.available()) {
-    String response = sim800.readString();
-    Serial.println("Operator Response: " + response);
-  } else {
-    Serial.println("Operator Response: No Response");
-  }
-
-  // Send AT+CREG? to check network registration
-  sim800.println("AT+CREG?");
-  delay(1000);
-  if (sim800.available()) {
-    String response = sim800.readString();
-    Serial.println("Network Registration Response: " + response);
-  } else {
-    Serial.println("Network Registration Response: No Response");
-  }
+  Serial.println("SIM800L Status: " + sim800Status);
 }
 
 // Function to Update GPS Time
@@ -542,7 +498,7 @@ void sendTriggerIfBelowTwoMeters() {
   if (distance > 0 && distance < 200) { // Check if distance is below 2 meters (200 cm)
     sendTriggerToESP32CAM(); // Call the function to send the trigger signal
     Serial.println("Trigger sent to ESP32-CAM as distance is below 2 meters.");
-    delay(3000); // Prevent rapid retriggering
+    delay(1000); // Prevent rapid retriggering
   }
 }
 
@@ -568,5 +524,51 @@ void monitorUDPTransmission(const char *command, const IPAddress &esp32CamIP, ui
     Serial.println(esp32CamIP);
     Serial.print("Target Port: ");
     Serial.println(esp32CamPort);
+  }
+}
+
+void checkSIM800L() {
+  // Send AT command and check response
+  sim800.println("AT");
+  delay(1000);
+  if (sim800.available()) {
+    String response = sim800.readString();
+    if (response.indexOf("OK") != -1) {
+      Serial.println("AT Command Response: OK");
+    } else {
+      Serial.println("AT Command Response: Not Detected");
+    }
+  } else {
+    Serial.println("AT Command Response: No Response");
+  }
+
+  // Send AT+CSQ to check signal quality
+  sim800.println("AT+CSQ");
+  delay(1000);
+  if (sim800.available()) {
+    String response = sim800.readString();
+    Serial.println("Signal Quality Response: " + response);
+  } else {
+    Serial.println("Signal Quality Response: No Response");
+  }
+
+  // Send AT+COPS? to check operator
+  sim800.println("AT+COPS?");
+  delay(1000);
+  if (sim800.available()) {
+    String response = sim800.readString();
+    Serial.println("Operator Response: " + response);
+  } else {
+    Serial.println("Operator Response: No Response");
+  }
+
+  // Send AT+CREG? to check network registration
+  sim800.println("AT+CREG?");
+  delay(1000);
+  if (sim800.available()) {
+    String response = sim800.readString();
+    Serial.println("Network Registration Response: " + response);
+  } else {
+    Serial.println("Network Registration Response: No Response");
   }
 }
