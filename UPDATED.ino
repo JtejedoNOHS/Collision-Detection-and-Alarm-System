@@ -1,438 +1,251 @@
-#include <Wire.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
+/**
+ * LilyGO T-A76XX (A7670X/SIM7670G) Local Web Status + SMS + GPS Example (V8)
+ * 
+ * - Shows SIM, network, signal, carrier, and firmware version.
+ * - Displays GPS latitude and longitude (decimal degrees or "GPS not fixed").
+ * - Has an editable recipient number field (pre-filled with default), and a single "Send" SMS button with a pre-defined message.
+ * 
+ * Compatible with LilyGO-T-A76XX boards (A7670X/SIM7670G).
+ */
+
+#include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <Preferences.h>
-#include <math.h>
-#include <TinyGPS++.h>
 
-// OLED Display
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+#define MODEM_TX_PIN        26
+#define MODEM_RX_PIN        27
+#define BOARD_PWRKEY_PIN    4
+#define BOARD_POWERON_PIN   12
+#define MODEM_RESET_PIN     5
+#define MODEM_BAUDRATE      115200
 
-// MPU6050 Accelerometer and Gyro
-Adafruit_MPU6050 mpu;
-bool mpuAvailable = false; // Track MPU availability
-
-// Ultrasonic Sensor Pins
-#define TRIG_PIN 12
-#define ECHO_PIN 13
-
-// Buzzer and Buttons
-#define BUZZER_PIN 25
-#define RESET_PIN 26 // Combined reset and manual alert button
-
-// GSM Module and GPS using HardwareSerial
-HardwareSerial sim800(1);
-HardwareSerial gps(2);
-#define SIM800_RX 16
-#define SIM800_TX 17
-#define GPS_RX 4
-#define GPS_TX 5
-
-// Access Point Configuration
-const char *ssid = "ESP32-Accident-System";
-const char *password = "12345678";
-
-// Web Server
+const char* ssid = "PLDTHOMEFIBRa6d98";
+const char* password = "PLDTWIFI26umx";
+HardwareSerial SerialAT(1);
 WebServer server(80);
-Preferences preferences;
 
-// TinyGPS++ Object
-TinyGPSPlus gpsParser;
+// Default recipient and message
+const char* defaultRecipient = "+639948244158";
+const char* preDefinedMessage = "Hello from LilyGO T-A76XX!";
 
-// Variables
-float filteredGX = 0, filteredGY = 0, filteredGZ = 0;
-float totalG, ultrasonicDistance = 0;
-String severity = "No Accident";
-String gpsLocation = "GPS Unavailable";
-String gpsTime = "Time: Unavailable";
-bool accidentDetected = false;
-String carOrientation = "Upright";
-String sim800Status = "Checking...";
+String smsResult = "";
+String lastRecipient = defaultRecipient; // To remember last used recipient
 
-// Timer Variables for Reset Button
-unsigned long resetButtonPressTime = 0;
-unsigned long resetButtonReleaseTime = 0; // To track release time for short press
-const unsigned long resetHoldDuration = 30000; // 30 seconds
-const unsigned long shortPressDuration = 500; // 500 milliseconds for short press detection
+// Function declarations
+String sendAT(const char* cmd, uint32_t timeout = 1500, bool waitForPrompt = false);
+String getGPS();
+String getSIMStatus();
+String getNetworkStatus();
+String getSignalQuality();
+String getCarrier();
+String getVersion();
+String sendSMS(String recipient, String message);
 
-// Timer Variables for Accident SMS Delay
-const unsigned long accidentSMSDelay = 5000; // 5 seconds
-unsigned long accidentDetectionTime = 0;
-bool sendSMSAfterDelay = false;
+void modemPowerOn() {
+    pinMode(BOARD_POWERON_PIN, OUTPUT);
+    digitalWrite(BOARD_POWERON_PIN, HIGH);
+    delay(100);
 
-// Timer Variables for Page Switching
-unsigned long pageCycleTime = 0; // Time to track page cycling
-const unsigned long pageSwitchInterval = 5000; // Switch pages every 5 seconds
-int currentPage = 1; // Start on Page 1
+    pinMode(MODEM_RESET_PIN, OUTPUT);
+    digitalWrite(MODEM_RESET_PIN, LOW);
+    delay(100);
+    digitalWrite(MODEM_RESET_PIN, HIGH);
+    delay(2600);
+    digitalWrite(MODEM_RESET_PIN, LOW);
 
-// G-Force Threshold
-const float gForceThreshold = 3.0; // Threshold for accident detection
+    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    delay(100);
+    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+    delay(100);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    delay(2000);
+}
+
+String sendAT(const char* cmd, uint32_t timeout, bool waitForPrompt) {
+    while (SerialAT.available()) SerialAT.read();
+    SerialAT.println(cmd);
+    String resp = "";
+    uint32_t start = millis();
+    if (waitForPrompt) {
+        while (millis() - start < timeout) {
+            if (SerialAT.available()) {
+                char c = SerialAT.read();
+                resp += c;
+                if (c == '>') break;
+            }
+        }
+    } else {
+        while (millis() - start < timeout) {
+            if (SerialAT.available())
+                resp += char(SerialAT.read());
+            if (resp.indexOf("OK") >= 0 || resp.indexOf("ERROR") >= 0) break;
+        }
+    }
+    return resp;
+}
+
+String getGPS() {
+    sendAT("AT+CGPS=1,1", 2000);
+    String resp = sendAT("AT+CGPSINFO", 2000);
+    int i = resp.indexOf("+CGPSINFO:");
+    if (i >= 0) {
+        int end = resp.indexOf('\n', i);
+        String info = resp.substring(i + 10, end);
+        info.trim();
+        if (info.length() == 0 || info.indexOf(",") == 0) return "GPS not fixed";
+        int p1 = info.indexOf(',');
+        if (p1 == -1) return "GPS parse error";
+        String lat = info.substring(0, p1);
+        int p2 = info.indexOf(',', p1 + 1);
+        String lat_dir = info.substring(p1 + 1, p2);
+        int p3 = info.indexOf(',', p2 + 1);
+        String lon = info.substring(p2 + 1, p3);
+        int p4 = info.indexOf(',', p3 + 1);
+        String lon_dir = info.substring(p3 + 1, p4);
+
+        if (lat.length() > 0 && lon.length() > 0 && lat != "0.0" && lon != "0.0") {
+            float lat_dd = 0, lon_dd = 0;
+            if (lat.length() > 4 && lon.length() > 5) {
+                float lat_val = lat.toFloat();
+                float lon_val = lon.toFloat();
+                lat_dd = int(lat_val / 100) + fmod(lat_val, 100) / 60.0;
+                lon_dd = int(lon_val / 100) + fmod(lon_val, 100) / 60.0;
+                if (lat_dir == "S") lat_dd = -lat_dd;
+                if (lon_dir == "W") lon_dd = -lon_dd;
+                char buf[96];
+                snprintf(buf, sizeof(buf),
+                    "Latitude: %.6f %s<br>Longitude: %.6f %s", lat_dd, lat_dir.c_str(), lon_dd, lon_dir.c_str());
+                return String(buf);
+            }
+            return "Latitude: " + lat + " " + lat_dir + "<br>Longitude: " + lon + " " + lon_dir;
+        } else {
+            return "GPS not fixed";
+        }
+    }
+    return "No GPS info";
+}
+
+String getSIMStatus() {
+    String r = sendAT("AT+CPIN?");
+    int i = r.indexOf("+CPIN:");
+    if (i >= 0) {
+        int eol = r.indexOf('\n', i);
+        return r.substring(i, eol);
+    }
+    return "No SIM or unknown";
+}
+String getNetworkStatus() {
+    String r = sendAT("AT+CGREG?");
+    int i = r.indexOf("+CGREG:");
+    if (i >= 0) {
+        int eol = r.indexOf('\n', i);
+        return r.substring(i, eol);
+    }
+    return "Unknown network status";
+}
+String getSignalQuality() {
+    String r = sendAT("AT+CSQ");
+    int i = r.indexOf("+CSQ:");
+    if (i >= 0) {
+        int eol = r.indexOf('\n', i);
+        return r.substring(i, eol);
+    }
+    return "Unknown signal";
+}
+String getCarrier() {
+    String r = sendAT("AT+COPS?");
+    int i = r.indexOf("+COPS:");
+    if (i >= 0) {
+        int quote1 = r.indexOf('"', i);
+        int quote2 = r.indexOf('"', quote1 + 1);
+        if (quote1 >= 0 && quote2 > quote1)
+            return r.substring(quote1 + 1, quote2);
+        int eol = r.indexOf('\n', i);
+        return r.substring(i, eol);
+    }
+    return "Unknown carrier";
+}
+String getVersion() {
+    String r = sendAT("AT+SIMCOMATI");
+    return r.length() > 0 ? r : "Unknown modem";
+}
+
+String sendSMS(String recipient, String message) {
+    String resp = sendAT("AT+CMGF=1", 1000);
+    // FIX: Only fail if "OK" is NOT present
+    if (resp.indexOf("OK") == -1) {
+        return "Failed to set text mode: " + resp;
+    }
+    resp = sendAT(("AT+CMGS=\"" + recipient + "\"").c_str(), 2000, true);
+    if (resp.indexOf('>') == -1) return "No prompt for SMS text: " + resp;
+    SerialAT.print(message);
+    SerialAT.write(0x1A); // Ctrl+Z
+    uint32_t start = millis();
+    String result = "";
+    while (millis() - start < 12000) {
+        if (SerialAT.available()) {
+            char c = SerialAT.read();
+            result += c;
+            if (result.indexOf("OK") >= 0 || result.indexOf("ERROR") >= 0) break;
+        }
+    }
+    if (result.indexOf("OK") != -1) return "SMS Sent!";
+    if (result.indexOf("ERROR") != -1) return "SMS Failed: " + result;
+    return "Unknown SMS result: " + result;
+}
+
+void handleRoot() {
+    String html = "<h2>LilyGO T-A76XX Modem Status, GPS & SMS (V8)</h2>";
+    html += "<b>SIM Status:</b> " + getSIMStatus() + "<br>";
+    html += "<b>Network Status:</b> " + getNetworkStatus() + "<br>";
+    html += "<b>Signal Quality:</b> " + getSignalQuality() + "<br>";
+    html += "<b>Carrier:</b> " + getCarrier() + "<br>";
+    html += "<b>Version:</b> <pre>" + getVersion() + "</pre>";
+    html += "<b>GPS:</b><br>" + getGPS() + "<br>";
+    html += "<hr>";
+    html += "<h3>Send Predefined SMS</h3>";
+    if (smsResult.length()) html += "<b>Result:</b> " + smsResult + "<br>";
+    html += "<form action=\"/send_sms\" method=\"POST\">";
+    html += "Recipient (number): <input name=\"recipient\" type=\"text\" value=\"" + (lastRecipient.length() ? lastRecipient : defaultRecipient) + "\" required pattern=\"[\\d\\+]+\"><br>";
+    html += "<input type=\"submit\" value=\"Send\">";
+    html += "</form>";
+    html += "<hr><small>Refresh to update statuses. GPS requires outdoor antenna for fix.</small>";
+    server.send(200, "text/html", html);
+}
+
+void handleSendSMS() {
+    String recipient = defaultRecipient;
+    if (server.hasArg("recipient") && server.arg("recipient").length() > 0) {
+        recipient = server.arg("recipient");
+        lastRecipient = recipient;
+    }
+    smsResult = sendSMS(recipient, String(preDefinedMessage));
+    server.sendHeader("Location", "/", true);
+    server.send(303, "text/plain", "");
+}
 
 void setup() {
-  Serial.begin(115200);
+    Serial.begin(115200);
+    Serial.println("Starting T-A76XX Web Status + SMS + GPS Example (V8)");
 
-  // Initialize OLED Display
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("OLED initialization failed!");
-    while (1);
-  }
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+    modemPowerOn();
+    SerialAT.begin(MODEM_BAUDRATE, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
 
-  // Attempt to Initialize MPU6050
-  initializeMPU();
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    Serial.print("Connecting WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500); Serial.print(".");
+    }
+    Serial.println(" Connected!");
+    Serial.print("IP: "); Serial.println(WiFi.localIP());
 
-  // Initialize Ultrasonic Sensor
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-
-  // Initialize Buzzer and Buttons
-  pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(RESET_PIN, INPUT_PULLUP);
-
-  // Initialize SIM800L UART
-  sim800.begin(9600, SERIAL_8N1, SIM800_RX, SIM800_TX);
-  delay(1000);
-  checkSIM800L(); // Check if SIM800L is working
-
-  // Initialize GPS UART
-  gps.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
-
-  // Initialize Preferences
-  preferences.begin("sms-config", false);
-  String recipientNumber = preferences.getString("phone", "+639123456789");
-  Serial.println("Loaded phone number: " + recipientNumber);
-
-  // Configure Wi-Fi Access Point
-  WiFi.softAP(ssid, password);
-  Serial.println("AP IP Address: " + WiFi.softAPIP().toString());
-
-  // Configure Web Server
-  server.on("/", []() {
-    String html = "<h1>ESP32 Accident Detection System</h1>";
-    server.send(200, "text/html", html);
-  });
-  server.begin();
+    server.on("/", handleRoot);
+    server.on("/send_sms", HTTP_POST, handleSendSMS);
+    server.begin();
 }
 
 void loop() {
-  // Handle Web Server
-  server.handleClient();
-
-  // Check if the reset button is pressed
-  if (digitalRead(RESET_PIN) == LOW) { // Assuming LOW indicates button press
-    if (resetButtonPressTime == 0) {
-      resetButtonPressTime = millis(); // Start timing the button press
-    } else if (millis() - resetButtonPressTime >= resetHoldDuration) {
-      disableSystem(); // Disable the whole system after holding for 30 seconds
-    }
-  } else if (resetButtonPressTime > 0) { // Button was released
-    resetButtonReleaseTime = millis();
-    if (resetButtonReleaseTime - resetButtonPressTime < resetHoldDuration &&
-        resetButtonReleaseTime - resetButtonPressTime > shortPressDuration) {
-      triggerManualAlert(); // Short press triggers manual alert
-    }
-    resetButtonPressTime = 0; // Reset the timer
-  }
-
-  // Attempt to reinitialize MPU6050 if it is not available
-  if (!mpuAvailable) {
-    initializeMPU();
-  }
-
-  // Process GPS Data
-  while (gps.available() > 0) {
-    gpsParser.encode(gps.read());
-  }
-
-  // Update GPS Time
-  updateGPSTime();
-
-  // Read Accelerometer and Gyro Data only if MPU is available
-  if (mpuAvailable) {
-    sensors_event_t accel, gyro, temp;
-    mpu.getEvent(&accel, &gyro, &temp);
-
-    // Apply Low-Pass Filter to Smooth Data
-    filteredGX = 0.8 * filteredGX + 0.2 * accel.acceleration.x;
-    filteredGY = 0.8 * filteredGY + 0.2 * accel.acceleration.y;
-    filteredGZ = 0.8 * filteredGZ + 0.2 * accel.acceleration.z;
-
-    // Compute Total G-Force
-    totalG = sqrt(filteredGX * filteredGX + filteredGY * filteredGY + filteredGZ * filteredGZ);
-
-    // Detect Car Orientation and Rollover
-    detectCarOrientation(accel, gyro);
-  }
-
-  // Handle SMS Delay for Accident Detection
-  if (sendSMSAfterDelay && millis() - accidentDetectionTime >= accidentSMSDelay) {
-    sendAccidentAlert(); // Send SMS after delay
-    sendSMSAfterDelay = false; // Reset the flag
-  }
-
-  // Measure Ultrasonic Distance
-  ultrasonicDistance = getUltrasonicDistance();
-
-  // Cycle Between Pages
-  if (millis() - pageCycleTime > pageSwitchInterval) {
-    currentPage = (currentPage == 1) ? 2 : 1; // Toggle between Page 1 and Page 2
-    pageCycleTime = millis(); // Reset the cycle timer
-  }
-
-  // Display the Current Page
-  displayPage(currentPage);
-
-  delay(100);
-}
-
-// Function to Disable the Entire System
-void disableSystem() {
-  Serial.println("System Disabled!");
-
-  // Turn off all outputs
-  digitalWrite(BUZZER_PIN, LOW);
-
-  // Display "System Disabled" on OLED
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.print("System Disabled!");
-  display.display();
-
-  while (1); // Stop the program
-}
-
-// Function to Reset System State
-void resetSystem() {
-  Serial.println("System Reset Triggered!");
-
-  // Reset accident detection flags
-  accidentDetected = false;
-  sendSMSAfterDelay = false;
-  carOrientation = "Upright";
-
-  // Stop the buzzer
-  digitalWrite(BUZZER_PIN, LOW);
-
-  // Clear OLED display
-  display.clearDisplay();
-  display.display();
-}
-
-// Function to Trigger Manual Alert (SMS and Buzzer)
-void triggerManualAlert() {
-  Serial.println("Manual Alert Triggered!");
-
-  // Activate the buzzer
-  digitalWrite(BUZZER_PIN, HIGH);
-
-  // Send an SMS alert
-  sendManualSMS();
-
-  // Keep the buzzer on for 5 seconds, then turn it off
-  delay(5000);
-  digitalWrite(BUZZER_PIN, LOW);
-}
-
-// Function to Detect Car Orientation and Trigger Alerts
-void detectCarOrientation(sensors_event_t &accel, sensors_event_t &gyro) {
-  const float uprightAccelZThreshold = 8.0;
-  const float flippedAccelZThreshold = -8.0;
-  const float sideAccelThreshold = 2.0;
-
-  // Check Static Orientation with Accelerometer
-  if (filteredGZ > uprightAccelZThreshold) {
-    carOrientation = "Upright";
-    accidentDetected = false;
-    sendSMSAfterDelay = false;
-
-    // Turn off the buzzer
-    digitalWrite(BUZZER_PIN, LOW);
-  } else if (filteredGZ < flippedAccelZThreshold || fabs(filteredGX) > sideAccelThreshold || fabs(filteredGY) > sideAccelThreshold) {
-    carOrientation = (filteredGZ < flippedAccelZThreshold) ? "Flipped" : "On Side";
-    accidentDetected = true;
-
-    // Turn on the buzzer
-    digitalWrite(BUZZER_PIN, HIGH);
-
-    // Start the SMS delay timer
-    if (!sendSMSAfterDelay) {
-      accidentDetectionTime = millis();
-      sendSMSAfterDelay = true;
-    }
-  } else {
-    carOrientation = "Unknown";
-    accidentDetected = false;
-    sendSMSAfterDelay = false;
-
-    // Turn off the buzzer
-    digitalWrite(BUZZER_PIN, LOW);
-  }
-}
-
-// Function to Initialize MPU6050
-void initializeMPU() {
-  Serial.println("Attempting to initialize MPU6050...");
-  if (mpu.begin()) {
-    mpuAvailable = true;
-    Serial.println("MPU6050 initialized successfully!");
-    mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
-    mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-  } else {
-    mpuAvailable = false;
-    Serial.println("MPU6050 not detected. Retrying...");
-    delay(2000); // Retry after 2 seconds
-  }
-}
-
-// Function to Check if SIM800L is Working
-void checkSIM800L() {
-  sim800.println("AT"); // Send AT command
-  delay(1000);
-
-  if (sim800.available()) {
-    String response = sim800.readString();
-    if (response.indexOf("OK") != -1) {
-      sim800Status = "Working";
-    } else {
-      sim800Status = "Not Detected";
-    }
-  } else {
-    sim800Status = "Not Detected";
-  }
-  Serial.println("SIM800L Status: " + sim800Status);
-}
-
-// Function to Update GPS Time
-void updateGPSTime() {
-  if (gpsParser.time.isValid()) {
-    char timeBuffer[16];
-    sprintf(timeBuffer, "%02d:%02d:%02d", gpsParser.time.hour(), gpsParser.time.minute(), gpsParser.time.second());
-    gpsTime = String("Time: ") + timeBuffer;
-  } else {
-    gpsTime = "Time: Unavailable";
-  }
-}
-
-// Function to Send Manual SMS Alert
-void sendManualSMS() {
-  String latitude = gpsParser.location.isValid() ? String(gpsParser.location.lat(), 6) : "Unavailable";
-  String longitude = gpsParser.location.isValid() ? String(gpsParser.location.lng(), 6) : "Unavailable";
-
-  // Generate Google Maps link
-  String googleMapsLink = "https://www.google.com/maps?q=" + latitude + "," + longitude;
-
-  // Construct the message
-  String alertMessage = String("Manual Alert!\n") +
-                      "Orientation: " + carOrientation + "\n" +
-                      "Location: Latitude: " + latitude + ", Longitude: " + longitude + "\n" +
-                      "Time: " + gpsTime + "\n" +
-                      "View location: " + googleMapsLink;
-
-  // Send the SMS
-  sim800.println("AT+CMGF=1"); // Set SMS to Text Mode
-  delay(100);
-  sim800.println("AT+CMGS=\"+639123456789\""); // Replace with recipient's number
-  delay(100);
-  sim800.print(alertMessage);
-  delay(100);
-  sim800.write(26); // Send Ctrl+Z to indicate the end of the message
-  delay(5000); // Wait for the message to be sent
-
-  // Log the message to Serial
-  Serial.println("SMS Sent: " + alertMessage);
-}
-
-// Function to Send Accident SMS Alert
-void sendAccidentAlert() {
-  String latitude = gpsParser.location.isValid() ? String(gpsParser.location.lat(), 6) : "Unavailable";
-  String longitude = gpsParser.location.isValid() ? String(gpsParser.location.lng(), 6) : "Unavailable";
-
-  // Generate Google Maps link
-  String googleMapsLink = "https://www.google.com/maps?q=" + latitude + "," + longitude;
-
-  // Construct the message
-  String alertMessage = String("Accident Detected!\n") +
-                      "Orientation: " + carOrientation + "\n" +
-                      "Location: Latitude: " + latitude + ", Longitude: " + longitude + "\n" +
-                      "Time: " + gpsTime + "\n" +
-                      "View location: " + googleMapsLink;
-
-  // Send the SMS
-  sim800.println("AT+CMGF=1"); // Set SMS to Text Mode
-  delay(100);
-  sim800.println("AT+CMGS=\"+639123456789\""); // Replace with recipient's number
-  delay(100);
-  sim800.print(alertMessage);
-  delay(100);
-  sim800.write(26); // Send Ctrl+Z to indicate the end of the message
-  delay(5000); // Wait for the message to be sent
-
-  // Log the message to Serial
-  Serial.println("SMS Sent: " + alertMessage);
-}
-
-// Function to Get Ultrasonic Distance
-float getUltrasonicDistance() {
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
-
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-
-  if (duration == 0) return -1;
-  float distance = duration * 0.034 / 2;
-  if (distance < 2 || distance > 400) return -1;
-  return distance;
-}
-
-// Function to Display the Current Page
-void displayPage(int page) {
-  display.clearDisplay();
-  if (page == 1) {
-    display.setCursor(0, 0);
-    display.print(gpsTime);
-
-    if (gpsParser.location.isValid()) {
-      display.setCursor(0, 10);
-      display.print("GPS: Lat ");
-      display.print(gpsParser.location.lat(), 2);
-      display.print(", Lng ");
-      display.print(gpsParser.location.lng(), 2);
-    } else {
-      display.setCursor(0, 10);
-      display.print("GPS: Unavailable");
-    }
-
-    display.setCursor(0, 20);
-    display.print("SIM800L: ");
-    display.print(sim800Status);
-
-    display.setCursor(0, 30);
-    display.print("Orientation: ");
-    display.print(carOrientation);
-
-  } else if (page == 2) {
-    display.setCursor(0, 0);
-    display.print("Total G: ");
-    display.print(totalG, 2);
-
-    display.setCursor(0, 10);
-    display.print("Distance: ");
-    display.print(ultrasonicDistance, 2);
-    display.print(" cm");
-
-    display.setCursor(0, 20);
-    display.print("Accident: ");
-    display.print(accidentDetected ? "YES" : "NO");
-  }
-  display.display();
+    server.handleClient();
 }
